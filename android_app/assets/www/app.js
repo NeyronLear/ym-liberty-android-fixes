@@ -242,6 +242,8 @@ function updatePlaybackContextHeader(subtitle, title) {
       state.playbackContext = { subtitle: 'ТРЕКИ АРТИСТА', title: state.currentTrack?.artist || 'Артист' };
     } else if (state.queueMode === 'downloads') {
       state.playbackContext = { subtitle: 'ОФЛАЙН-ПРОСЛУШИВАНИЕ', title: 'Загрузки' };
+    } else if (state.queueMode === 'queue') {
+      state.playbackContext = { subtitle: 'ИГРАЕТ ИЗ ОЧЕРЕДИ', title: 'Очередь' };
     } else {
       state.playbackContext = { subtitle: 'ИГРАЕТ ИЗ КОЛЛЕКЦИИ', title: 'Любимые треки' };
     }
@@ -281,10 +283,10 @@ function openArtistFromPlayer(artistId) {
   if (fromPlayer) state.returnToPlayerDepth = state.viewHistory.length;
 }
 
-function openAlbumFromPlayer(albumId) {
+function openAlbumFromAnywhere(albumId, title, coverUri) {
   const fromPlayer = !dom.fullPlayer.classList.contains('translateY-100');
   dom.fullPlayer.classList.add('translateY-100');
-  openAlbum(albumId);
+  openAlbum(albumId, title, coverUri);
   if (fromPlayer) state.returnToPlayerDepth = state.viewHistory.length;
 }
 
@@ -942,6 +944,9 @@ function getNextTrack() {
     }
     return null;
   } else {
+    if (state.isShuffle && state.queue[state.queueIndex + 1]?._userQueued) {
+      return state.queue[state.queueIndex + 1];
+    }
     if (state.isShuffle) {
       if (state.nextShuffleIndex === undefined || state.nextShuffleIndex === null) {
         state.nextShuffleIndex = Math.floor(Math.random() * state.queue.length);
@@ -964,6 +969,9 @@ async function preloadNextTrack() {
     if (!state.token) return;
     if (state.queueMode === 'vibe' && state.queueIndex + 2 >= state.queue.length) {
       fetchMoreVibeTracks().catch(() => {});
+    }
+    if (state.queueMode === 'artist' && state.queueIndex + 3 >= state.queue.length) {
+      extendArtistQueue().catch(() => {});
     }
 
     const nextTrack = getNextTrack();
@@ -1170,7 +1178,8 @@ function finishCrossfade(outgoingPlayer, incomingPlayer, nextTrackInfo) {
     if (state.queueIndex >= state.queue.length) {
       fetchMoreVibeTracks().catch(() => {});
     }
-    if (nextTrackInfo) {
+    const queuedByHand = state.queue[state.queueIndex]?._fromUser;
+    if (nextTrackInfo && !queuedByHand) {
       vibeHistoryAdd(nextTrackInfo.id);
       sendFeedback('trackStarted', nextTrackInfo.id, 0);
       if (typeof addTrackToCloudSync === 'function') {
@@ -1178,7 +1187,10 @@ function finishCrossfade(outgoingPlayer, incomingPlayer, nextTrackInfo) {
       }
     }
   } else if (!repeatOne) {
-    if (state.isShuffle) {
+    if (state.isShuffle && state.queue[state.queueIndex + 1]?._userQueued) {
+      state.queueIndex++;
+      state.nextShuffleIndex = null;
+    } else if (state.isShuffle) {
       state.queueIndex = (state.nextShuffleIndex !== undefined && state.nextShuffleIndex !== null)
         ? state.nextShuffleIndex
         : Math.floor(Math.random() * state.queue.length);
@@ -1189,30 +1201,18 @@ function finishCrossfade(outgoingPlayer, incomingPlayer, nextTrackInfo) {
     }
   }
 
-  // The outgoing player's pause event above reported "paused" to the native
-  // MediaSession. Flip to playing BEFORE updateTrackUI() (it syncs the
-  // notification) and push an explicit sync afterwards. Without this the
-  // foreground service kept mIsPlaying=false after every crossfade, released
-  // its wake lock and stopped itself five minutes later — playback died in the
-  // background in the middle of a Wave.
-  state.isPlaying = true;
+  if (state.queue[state.queueIndex]) delete state.queue[state.queueIndex]._userQueued;
   const targetTrack = nextTrackInfo || state.queue[state.queueIndex];
   if (targetTrack) {
     updateTrackUI(targetTrack);
   }
   updatePlayButtons();
-  syncNativeMedia(
-    state.currentTrack?.title,
-    state.currentTrack?.artist,
-    true,
-    (activePlayer.currentTime || 0) * 1000,
-    (activePlayer.duration || 0) * 1000,
-    state.currentTrack?.cover
-  );
-  // The outgoing player's pause handler above persisted the *old* track/index
-  // a few lines earlier. Save the post-swap state now so a kill right after the
-  // transition resumes the track that is actually playing.
-  try { savePlaybackState(true); } catch (_) {}
+  // The incoming player's own 'play' event fired while it was still the
+  // preload player and was ignored, so nothing else tells the native session
+  // (and with it the foreground service and its wake lock) that we are playing.
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+  syncNativeMedia(state.currentTrack?.title, state.currentTrack?.artist, true, (activePlayer.currentTime || 0) * 1000, (activePlayer.duration || 0) * 1000, state.currentTrack?.cover);
+  savePlaybackState(true);
   setTimeout(preloadNextTrack, 600);
 }
 
@@ -1234,8 +1234,14 @@ async function playNext(isUserSkip = true) {
     return;
   }
 
-  if (state.queueMode === 'vibe' && isUserSkip) {
+  if (state.queueMode === 'vibe' && isUserSkip && !state.queue[state.queueIndex]?._fromUser) {
     sendFeedback('skip', state.queue[state.queueIndex]?.id, Math.floor(activePlayer.currentTime || 0));
+  }
+
+  // Artist queues start with the first loaded page of the artist's tracks;
+  // pull the next page in before running off the end.
+  if (state.queueMode === 'artist' && !state.isShuffle && state.queueIndex + 1 >= state.queue.length) {
+    await extendArtistQueue();
   }
   
   if (state.queueMode === 'vibe') {
@@ -1289,7 +1295,11 @@ async function playNext(isUserSkip = true) {
       }
     }
   } else {
-    if (state.isShuffle) {
+    if (state.isShuffle && state.queue[state.queueIndex + 1]?._userQueued) {
+      // "Играть следующим" / "Добавить в очередь" win over shuffle.
+      state.queueIndex++;
+      state.nextShuffleIndex = null;
+    } else if (state.isShuffle) {
       state.queueIndex = (state.nextShuffleIndex !== undefined && state.nextShuffleIndex !== null)
         ? state.nextShuffleIndex
         : Math.floor(Math.random() * state.queue.length);
@@ -1370,8 +1380,15 @@ function playQueueTrack(track) {
   }
   
   const explicit = track.explicit || track.contentWarning === 'explicit';
-  
-  if (state.queueMode === 'vibe') {
+
+  // A queued-by-hand track stops being "pending" once it starts; the flag is
+  // what keeps later "Добавить в очередь" calls behind it and what shuffle
+  // checks to play it next.
+  delete track._userQueued;
+
+  // Tracks the user slipped into the Wave by hand were not recommended by
+  // the station, so they must not feed its trackStarted/skip feedback.
+  if (state.queueMode === 'vibe' && !track._fromUser) {
     vibeHistoryAdd(track.id);
     sendFeedback('trackStarted', track.id, 0);
     if (typeof addTrackToCloudSync === 'function') {
@@ -1596,6 +1613,7 @@ window.handleMediaAction = function(action) {
     if (!state.isPlaying) handlePlayToggle();
   } else if (action === 'pause') {
     clearNoisyAutoResume();
+    cancelCrossfadeForPause();
     try {
       activePlayer.pause();
       playerA.pause();
@@ -1610,6 +1628,7 @@ window.handleMediaAction = function(action) {
     if (Number.isFinite(position)) {
       try { savePlaybackState(true); } catch (_) {}
     }
+    cancelCrossfadeForPause();
     activePlayer.pause();
     playerA.pause();
     playerB.pause();
@@ -1661,6 +1680,18 @@ window.handleMediaSeek = function(posMs) {
 // Return true when the gesture was consumed by the UI.
 window.handleAndroidBack = function() {
   try {
+    // 0. Photo viewer and the album/playlist menu.
+    const photoViewer = document.getElementById('photo-viewer');
+    if (photoViewer && photoViewer.style.display === 'block') {
+      closePhotoViewer();
+      return true;
+    }
+    const collectionSheet = document.getElementById('collection-sheet');
+    if (collectionSheet && collectionSheet.style.display === 'block') {
+      closeCollectionSheet();
+      return true;
+    }
+
     // 1. Action sheet (three-dots menu) closes first.
     const actionSheet = document.getElementById('action-sheet');
     if (actionSheet && actionSheet.style.display !== 'none' && actionSheet.style.display !== '') {
@@ -1775,8 +1806,9 @@ function slimQueueEntry(t) {
     coverUri: t.coverUri || t.cover || '',
     explicit: !!t.explicit,
     isLiberty: !!t.isLiberty,
-    albumId: t.albumId || t.albums?.[0]?.id || 0,
-    artistId: t.artistId || t.artists?.[0]?.id || null
+    // Wave and list entries keep the API track one level down in .track.
+    albumId: t.albumId || t.albums?.[0]?.id || t.track?.albumId || t.track?.albums?.[0]?.id || 0,
+    artistId: t.artistId || t.artists?.[0]?.id || t.track?.artists?.[0]?.id || null
   };
 }
 
@@ -2180,6 +2212,11 @@ function bindAudioPlayerEvents(player) {
   });
   player.addEventListener('pause', (e) => {
     if (e.target !== activePlayer) return;
+    // The outgoing track reaching its end mid-crossfade is part of the
+    // transition, not a pause. Reporting it made the native session go PAUSED
+    // while the next track was already audible; the service then dropped its
+    // wake lock and stopped itself 5 minutes later, and the OS froze playback.
+    if (isCrossfading) return;
     if (typeof recordListeningProgress === 'function') recordListeningProgress();
     lastAudioSampleTime = null;
     state.isPlaying = false;
@@ -2193,6 +2230,16 @@ function bindAudioPlayerEvents(player) {
     if (e.target !== activePlayer) return;
     if (typeof recordListeningProgress === 'function') recordListeningProgress();
     checkAndTriggerCrossfade();
+  });
+  // The notification / lock-screen progress bar is extrapolated by the system
+  // from the last reported position. Anything that moves playback without a
+  // play/pause (seeking, buffering, stream recovery) has to be reported or the
+  // bar drifts away from the real position.
+  ['seeked', 'playing'].forEach(type => {
+    player.addEventListener(type, (e) => {
+      if (e.target !== activePlayer || isCrossfading) return;
+      syncNativeMedia(state.currentTrack?.title, state.currentTrack?.artist, !activePlayer.paused, (activePlayer.currentTime || 0) * 1000, (activePlayer.duration || 0) * 1000, state.currentTrack?.cover);
+    });
   });
   player.addEventListener('durationchange', (e) => {
     if (e.target !== activePlayer) return;
@@ -2225,6 +2272,15 @@ function bindAudioPlayerEvents(player) {
 }
 bindAudioPlayerEvents(playerA);
 bindAudioPlayerEvents(playerB);
+
+// Keeps the notification / lock-screen progress bar honest: the system
+// extrapolates it from the last reported position, so drift from buffering
+// or a missed update is corrected every 30 s. Also re-asserts the playing
+// state in case anything (crossfade, recovery) left the session out of sync.
+setInterval(() => {
+  if (isCrossfading || activePlayer.paused || !state.isPlaying) return;
+  syncNativeMedia(state.currentTrack?.title, state.currentTrack?.artist, true, (activePlayer.currentTime || 0) * 1000, (activePlayer.duration || 0) * 1000, state.currentTrack?.cover);
+}, 30000);
 
 const MAX_RECOVERIES_PER_TRACK = 2;
 const STALL_TIMEOUT_MS = 25000;
@@ -3027,11 +3083,20 @@ async function startTrackVibe(seedTrack) {
 }
 
 // UI Play Toggles
+// A pause in the middle of a crossfade must stop both tracks, and must happen
+// after the crossfade flag is cleared so the pause handler reports it.
+function cancelCrossfadeForPause() {
+  if (!isCrossfading) return;
+  resetCrossfadeState();
+  try { (activePlayer === playerA ? playerB : playerA).pause(); } catch (_) {}
+}
+
 function handlePlayToggle(e) {
   if (e && e.stopPropagation) e.stopPropagation();
   if (!state.currentTrack) return;
   clearNoisyAutoResume();
   if (state.isPlaying) {
+    cancelCrossfadeForPause();
     activePlayer.pause();
   } else {
     resumePlayback().then(ok => { if (!ok) updatePlayButtons(); });
@@ -3184,6 +3249,7 @@ function renderSearchResults(data) {
       div.addEventListener('click', (e) => {
         if (e.target.classList.contains('track-dots') || e.target.closest('.track-dots')) return;
         state.queueMode = 'library';
+        updatePlaybackContextHeader('ИГРАЕТ ИЗ ПОИСКА', (searchInput && searchInput.value.trim()) || 'Поиск');
         state.queue = tracks.map(tr => tr.track);
         state.queueIndex = tracks.findIndex(tr => tr.id === t.id);
         playTrack(t.id, t.title, t.artists, t.coverUri || PLACEHOLDER_COVER, t.explicit, t.isLiberty, t.track?.artists?.[0]?.id || null, t);
@@ -3229,6 +3295,7 @@ const albumTracksList = document.getElementById('album-tracks-list');
 const btnAlbumPlay = document.getElementById('btn-album-play');
 let currentAlbumTracks = [];
 let currentAlbumArtistId = null;
+let currentAlbumId = null;
 
 if (btnCloseAlbum) {
   btnCloseAlbum.addEventListener('click', () => {
@@ -3254,6 +3321,7 @@ async function openAlbum(id, title, coverUri) {
   albumTracksList.innerHTML = '<div style="text-align:center; padding: 20px;">Загрузка треков...</div>';
   currentAlbumTracks = [];
   currentAlbumArtistId = null;
+  currentAlbumId = id;
 
   try {
     const data = await YandexClient.getAlbum(id, state.token);
@@ -3409,14 +3477,188 @@ if (btnPlaylistPlay) {
   });
 }
 
+// Artist page state. Each openArtist() makes a new object, so a page that is
+// still loading for an artist the user already left can tell it is stale, and
+// an artist queue keeps paging through its own artist after the user browses
+// elsewhere.
+const ARTIST_TRACKS_PAGE_SIZE = 100;
+const ARTIST_TRACKS_COLLAPSED = 10;
+let artistPage = null;
+
+function artistQueueItem(tr) {
+  return { ...(tr.track || {}), id: tr.id, title: tr.title, isLiberty: tr.isLiberty, explicit: tr.explicit, artists: tr.artists, coverUri: tr.coverUri };
+}
+
+// Loads the next page of src's tracks (everything the artist has, most popular
+// first) and appends it to src.tracks. Returns the newly added tracks.
+async function loadMoreArtistTracks(src) {
+  if (!src || src.loading || !src.hasMore) return [];
+  src.loading = true;
+  if (src === artistPage) renderArtistTracks();
+  try {
+    const res = await YandexClient.getArtistTracks(src.artistId, state.token, src.nextPage, ARTIST_TRACKS_PAGE_SIZE);
+    const seen = new Set(src.tracks.map(t => String(t.id)));
+    const added = (res.tracks || []).filter(t => t && t.id && !seen.has(String(t.id)));
+    src.tracks.push(...added);
+    src.total = res.total;
+    src.nextPage++;
+    src.hasMore = (res.tracks || []).length > 0 && src.tracks.length < res.total;
+    return added;
+  } finally {
+    src.loading = false;
+    if (src === artistPage) renderArtistTracks();
+  }
+}
+
+// Called while an artist queue plays: appends the next page so playback
+// continues past the tracks that were loaded when Play was pressed.
+async function extendArtistQueue() {
+  const src = state.artistQueueSource;
+  if (state.queueMode !== 'artist' || !src || !src.hasMore) return;
+  try {
+    const added = await loadMoreArtistTracks(src);
+    if (added.length && state.queueMode === 'artist' && state.artistQueueSource === src) {
+      state.queue.push(...added.map(artistQueueItem));
+      savePlaybackState(true);
+    }
+  } catch (e) {
+    console.warn('artist queue extend failed', e);
+  }
+}
+
+function playArtistFrom(index) {
+  const src = artistPage;
+  if (!src || src.tracks.length === 0) return;
+  state.queueMode = 'artist';
+  state.artistQueueSource = src;
+  updatePlaybackContextHeader('ТРЕКИ АРТИСТА', artistPageName.textContent || 'Артист');
+  state.queue = src.tracks.map(artistQueueItem);
+  state.queueIndex = index;
+  const t = src.tracks[index];
+  playTrack(t.id, t.title, t.artists, t.coverUri || PLACEHOLDER_COVER, t.explicit, t.isLiberty, t.track?.artists?.[0]?.id || null, t);
+}
+
+function renderArtistTracks() {
+  const src = artistPage;
+  if (!src) return;
+  currentArtistTracks = src.tracks;
+  artistTracksList.innerHTML = '';
+  const visible = src.expanded ? src.tracks : src.tracks.slice(0, ARTIST_TRACKS_COLLAPSED);
+
+  visible.forEach((t, i) => {
+    const div = document.createElement('div');
+    div.className = 'track-item';
+    const isExplicit = t.explicit || t.contentWarning === 'explicit';
+    const badgeHtml = t.isLiberty ? `<span class="liberty-badge"><i class="bi bi-gem"></i></span>` : (isExplicit ? `<span class="explicit-badge">E</span>` : '');
+    div._trackData = t;
+    div.innerHTML = `
+      <img src="${t.coverUri || PLACEHOLDER_COVER}" loading="lazy" alt="cover">
+      <div class="track-info">
+        <div class="track-title"><span class="track-title-text">${escapeHtml(t.title)}</span>${badgeHtml}</div>
+        <div class="track-artist">${escapeHtml(t.artists)}</div>
+      </div>
+      <i class="bi bi-three-dots track-dots" style="color: var(--text-secondary);"></i>
+    `;
+    div.addEventListener('click', (e) => {
+      if (e.target.classList.contains('track-dots') || e.target.closest('.track-dots')) return;
+      playArtistFrom(i);
+    });
+    artistTracksList.appendChild(div);
+  });
+
+  const total = Math.max(src.total || 0, src.tracks.length);
+  let label = '';
+  if (!src.expanded && total > visible.length) {
+    label = `Все треки · ${total}`;
+  } else if (src.expanded && src.hasMore) {
+    label = src.loading ? 'Загрузка...' : `Показать ещё · ${src.tracks.length} из ${total}`;
+  }
+  if (label) {
+    const more = document.createElement('button');
+    more.className = 'artist-tracks-more';
+    more.textContent = label;
+    more.disabled = src.loading;
+    more.style.cssText = 'width: 100%; margin-top: 10px; padding: 12px; border: none; border-radius: 12px; background: rgba(255,255,255,0.08); color: inherit; font-weight: 600; font-size: 14px; cursor: pointer;';
+    more.onclick = () => {
+      if (!src.expanded) {
+        src.expanded = true;
+        renderArtistTracks();
+        if (src.tracks.length <= ARTIST_TRACKS_COLLAPSED && src.hasMore) loadMoreArtistTracks(src).catch(() => {});
+      } else {
+        loadMoreArtistTracks(src).catch(() => showToast('Не удалось загрузить треки', 'bi-wifi-off'));
+      }
+    };
+    artistTracksList.appendChild(more);
+  }
+}
+
+function renderArtistPhotos(photos) {
+  const section = document.getElementById('artist-photos-section');
+  const list = document.getElementById('artist-photos-list');
+  if (!section || !list) return;
+  list.innerHTML = '';
+  if (!photos || photos.length < 2) {
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = 'block';
+  photos.forEach((url, i) => {
+    const img = document.createElement('img');
+    img.src = url.replace('1000x1000', '400x400');
+    img.loading = 'lazy';
+    img.alt = 'Фото';
+    img.style.cssText = 'flex: 0 0 120px; width: 120px; height: 120px; border-radius: 8px; object-fit: cover; cursor: pointer;';
+    img.onclick = () => openPhotoViewer(photos, i);
+    list.appendChild(img);
+  });
+}
+
+function openPhotoViewer(photos, startIndex) {
+  const viewer = document.getElementById('photo-viewer');
+  const strip = document.getElementById('photo-viewer-strip');
+  const counter = document.getElementById('photo-viewer-counter');
+  if (!viewer || !strip) return;
+  strip.innerHTML = '';
+  photos.forEach(url => {
+    const slide = document.createElement('div');
+    slide.style.cssText = 'flex: 0 0 100%; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; scroll-snap-align: center;';
+    const img = document.createElement('img');
+    img.src = url;
+    img.alt = 'Фото';
+    img.style.cssText = 'max-width: 100%; max-height: 100%; object-fit: contain;';
+    slide.appendChild(img);
+    strip.appendChild(slide);
+  });
+  const updateCounter = () => {
+    const idx = Math.round(strip.scrollLeft / Math.max(1, strip.clientWidth));
+    if (counter) counter.textContent = `${Math.min(idx + 1, photos.length)} / ${photos.length}`;
+  };
+  strip.onscroll = updateCounter;
+  viewer.style.display = 'block';
+  strip.scrollLeft = strip.clientWidth * startIndex;
+  updateCounter();
+}
+
+function closePhotoViewer() {
+  const viewer = document.getElementById('photo-viewer');
+  if (viewer) viewer.style.display = 'none';
+}
+
+document.getElementById('photo-viewer-close')?.addEventListener('click', closePhotoViewer);
+
 async function openArtist(id) {
   state.currentArtistId = String(id);
   navigateToView('view-artist');
   artistPageName.textContent = "Загрузка...";
   artistTracksList.innerHTML = '<div style="text-align:center; padding: 20px;">Загрузка...</div>';
+  renderArtistPhotos([]);
+  const page = { artistId: id, tracks: [], total: 0, nextPage: 0, hasMore: true, loading: false, expanded: false };
+  artistPage = page;
+  currentArtistTracks = [];
 
   try {
     const data = await YandexClient.getArtist(id, state.token);
+    if (artistPage !== page) return;
 
     if (data.error) {
       artistPageName.textContent = "Ошибка";
@@ -3429,9 +3671,7 @@ async function openArtist(id) {
     } else {
       artistHeaderBg.style.background = 'var(--bg-color)';
     }
-
-    currentArtistTracks = data.tracks || [];
-    artistTracksList.innerHTML = '';
+    renderArtistPhotos(data.photos || []);
 
     const artistAlbumsList = document.getElementById('artist-albums-list');
     if (artistAlbumsList) {
@@ -3459,50 +3699,42 @@ async function openArtist(id) {
       }
     }
 
-    currentArtistTracks.forEach((t, i) => {
-      const div = document.createElement('div');
-      div.className = 'track-item';
-      const isExplicit = t.explicit || t.contentWarning === 'explicit';
-      const badgeHtml = t.isLiberty ? `<span class="liberty-badge"><i class="bi bi-gem"></i></span>` : (isExplicit ? `<span class="explicit-badge">E</span>` : '');
-      div._trackData = t;
-      div.innerHTML = `
-        <img src="${t.coverUri || PLACEHOLDER_COVER}" alt="cover">
-        <div class="track-info">
-          <div class="track-title"><span class="track-title-text">${escapeHtml(t.title)}</span>${badgeHtml}</div>
-          <div class="track-artist">${escapeHtml(t.artists)}</div>
-        </div>
-        <i class="bi bi-three-dots track-dots" style="color: var(--text-secondary);"></i>
-      `;
-
-      div.addEventListener('click', (e) => {
-        if (e.target.classList.contains('track-dots') || e.target.closest('.track-dots')) return;
-        state.queueMode = 'artist';
-        updatePlaybackContextHeader('ТРЕКИ АРТИСТА', artistPageName.textContent || 'Артист');
-        state.queue = currentArtistTracks.map(tr => ({ ...(tr.track || {}), id: tr.id, title: tr.title, isLiberty: tr.isLiberty, explicit: tr.explicit, artists: tr.artists, coverUri: tr.coverUri }));
-        state.queueIndex = i;
-        playTrack(t.id, t.title, t.artists, t.coverUri || PLACEHOLDER_COVER, t.explicit, t.isLiberty, t.track?.artists?.[0]?.id || null, t);
-      });
-
-      artistTracksList.appendChild(div);
-    });
-
+    // brief-info's ten popular tracks show at once; the full list (same
+    // order) replaces them as soon as its first page arrives.
+    page.tracks = (data.tracks || []).slice();
+    page.total = page.tracks.length;
+    renderArtistTracks();
   } catch (err) {
     console.error(err);
-    artistPageName.textContent = "Сетевая ошибка";
+    if (artistPage === page) artistPageName.textContent = "Сетевая ошибка";
+    return;
+  }
+
+  try {
+    const res = await YandexClient.getArtistTracks(id, state.token, 0, ARTIST_TRACKS_PAGE_SIZE);
+    if (artistPage !== page || !res.tracks || res.tracks.length === 0) return;
+    page.tracks = res.tracks;
+    page.total = res.total;
+    page.nextPage = 1;
+    page.hasMore = res.tracks.length < res.total;
+    renderArtistTracks();
+    // A queue started from the ten-track preview of this same page picks up
+    // the rest of the list.
+    if (state.queueMode === 'artist' && state.artistQueueSource === page) {
+      const queued = new Set(state.queue.map(t => String(t.id)));
+      const rest = page.tracks.filter(t => !queued.has(String(t.id)));
+      state.queue.push(...rest.map(artistQueueItem));
+    }
+  } catch (e) {
+    // Keep the ten popular tracks; the list just stays short.
+    console.warn('artist tracks failed', e);
+    page.hasMore = false;
+    if (artistPage === page) renderArtistTracks();
   }
 }
 
 if (btnArtistPlay) {
-  btnArtistPlay.addEventListener('click', () => {
-    if (currentArtistTracks.length > 0) {
-      state.queueMode = 'artist';
-      updatePlaybackContextHeader('ТРЕКИ АРТИСТА', artistPageName.textContent || 'Артист');
-      state.queue = currentArtistTracks.map(tr => ({ ...(tr.track || {}), id: tr.id, title: tr.title, isLiberty: tr.isLiberty, explicit: tr.explicit, artists: tr.artists, coverUri: tr.coverUri }));
-      state.queueIndex = 0;
-      const t = currentArtistTracks[0];
-      playTrack(t.id, t.title, t.artists, t.coverUri || PLACEHOLDER_COVER, t.explicit, t.isLiberty, t.track?.artists?.[0]?.id || null, t);
-    }
-  });
+  btnArtistPlay.addEventListener('click', () => playArtistFrom(0));
 }
 
 // Open/Close Full Player
@@ -4379,6 +4611,153 @@ async function downloadWholeLibrary(btn) {
   );
 }
 
+// --- Manual queue: "Играть следующим" / "Добавить в очередь" ---
+
+// Normalizes the several track shapes the UI passes around (list rows with a
+// nested .track, full-player info, raw API tracks) into a queue entry.
+function toQueueEntry(t) {
+  if (!t) return null;
+  const raw = t.track && typeof t.track === 'object' ? t.track : {};
+  const id = String(t.id || raw.id || '');
+  if (!id) return null;
+  let artists = t.artists;
+  if (artists === undefined || artists === null || artists === '') artists = t.artist || raw.artists || '';
+  return {
+    ...raw,
+    id,
+    title: t.title || raw.title || 'Трек',
+    artists,
+    coverUri: t.coverUri || t.cover || raw.coverUri || raw.albums?.[0]?.coverUri || '',
+    explicit: Boolean(t.explicit || raw.explicit || raw.contentWarning === 'explicit'),
+    isLiberty: Boolean(t.isLiberty || raw.isLiberty),
+    artistId: t.artistId || raw.artists?.[0]?.id || (Array.isArray(t.artists) ? t.artists[0]?.id : null) || null,
+    albumId: t.albumId || raw.albumId || raw.albums?.[0]?.id || 0
+  };
+}
+
+// where: 'next' puts the tracks right after the current one; 'end' puts them
+// at the end of the queue. The Wave has no end, so there 'end' means after
+// whatever the user already queued by hand.
+function enqueueTracks(tracks, where) {
+  const entries = (tracks || []).map(toQueueEntry).filter(Boolean)
+    .map(e => ({ ...e, _userQueued: true, _fromUser: true }));
+  if (entries.length === 0) return;
+  const toastText = entries.length === 1
+    ? (where === 'next' ? 'Трек будет следующим' : 'Трек добавлен в очередь')
+    : (where === 'next' ? `${entries.length} ${getTrackCountWord(entries.length)} будут следующими` : `${entries.length} ${getTrackCountWord(entries.length)} добавлено в очередь`);
+
+  // Nothing playing: the request becomes the queue.
+  if (!state.currentTrack || !state.queue || state.queue.length === 0) {
+    state.queueMode = 'queue';
+    state.artistQueueSource = null;
+    updatePlaybackContextHeader('ИГРАЕТ ИЗ ОЧЕРЕДИ', 'Очередь');
+    state.queue = entries;
+    state.queueIndex = 0;
+    playQueueTrack(state.queue[0]);
+    showToast(toastText, 'bi-list-ol');
+    return;
+  }
+
+  let at = state.queueIndex + 1;
+  if (where !== 'next') {
+    if (state.queueMode === 'vibe') {
+      while (at < state.queue.length && state.queue[at]?._userQueued) at++;
+    } else {
+      at = state.queue.length;
+    }
+  }
+  state.queue.splice(at, 0, ...entries);
+  state.nextShuffleIndex = null;
+  dropStalePreload();
+  preloadNextTrack();
+  savePlaybackState(true);
+  showToast(toastText, 'bi-list-ol');
+}
+
+// Bottom sheet for a whole album / playlist ("..." next to its Play button).
+function openCollectionSheet({ title, subtitle, cover, getTracks, extra = [] }) {
+  let sheet = document.getElementById('collection-sheet');
+  if (!sheet) {
+    sheet = document.createElement('div');
+    sheet.id = 'collection-sheet';
+    sheet.style.cssText = 'position: fixed; inset: 0; z-index: 1000; display: none;';
+    sheet.innerHTML = `
+      <div class="cs-bg" style="position: absolute; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"></div>
+      <div class="cs-content" style="position: absolute; bottom: 0; left: 0; width: 100%; background: var(--surface-color, #1e1e1e); border-top-left-radius: 20px; border-top-right-radius: 20px; padding: 20px 20px max(20px, calc(var(--safe-bottom, 0px) + 12px)); box-sizing: border-box; transform: translateY(100%); transition: transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); max-height: 80vh; overflow-y: auto;">
+        <div style="display: flex; align-items: center; margin-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 15px;">
+          <img class="cs-cover" src="${PLACEHOLDER_COVER}" style="width: 52px; height: 52px; border-radius: 8px; margin-right: 15px; object-fit: cover;">
+          <div style="overflow: hidden; flex: 1;">
+            <div class="cs-title" style="font-weight: bold; font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
+            <div class="cs-subtitle" style="color: var(--text-secondary); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
+          </div>
+        </div>
+        <div class="cs-actions" style="display: flex; flex-direction: column; gap: 8px;"></div>
+        <button class="cs-cancel" style="width: 100%; background: rgba(255,255,255,0.08); border: none; color: #fff; padding: 14px; border-radius: 12px; margin-top: 15px; font-weight: bold; cursor: pointer; min-height: 48px;">Отмена</button>
+      </div>`;
+    document.body.appendChild(sheet);
+    sheet.querySelector('.cs-bg').addEventListener('click', closeCollectionSheet);
+    sheet.querySelector('.cs-cancel').addEventListener('click', closeCollectionSheet);
+  }
+  sheet.querySelector('.cs-cover').src = cover || PLACEHOLDER_COVER;
+  sheet.querySelector('.cs-title').textContent = title || '';
+  sheet.querySelector('.cs-subtitle').textContent = subtitle || '';
+
+  const actions = sheet.querySelector('.cs-actions');
+  actions.innerHTML = '';
+  const addAction = (icon, text, handler) => {
+    const btn = document.createElement('button');
+    btn.className = 'as-btn';
+    btn.style.cssText = 'background: transparent; border: none; color: #fff; text-align: left; padding: 12px; font-size: 15px; display: flex; align-items: center; gap: 14px; border-radius: 8px; cursor: pointer;';
+    btn.innerHTML = `<i class="bi ${icon}" style="font-size: 18px;"></i> <span></span>`;
+    btn.querySelector('span').textContent = text;
+    btn.onclick = () => { closeCollectionSheet(); handler(); };
+    actions.appendChild(btn);
+  };
+  const queueAll = (where) => {
+    const tracks = getTracks();
+    if (!tracks || tracks.length === 0) {
+      showToast('Треки ещё не загрузились', 'bi-hourglass-split');
+      return;
+    }
+    enqueueTracks(tracks, where);
+  };
+  addAction('bi-skip-end', 'Играть следующим', () => queueAll('next'));
+  addAction('bi-list-ol', 'Добавить в очередь', () => queueAll('end'));
+  extra.forEach(x => addAction(x.icon, x.text, x.handler));
+
+  sheet.style.display = 'block';
+  setTimeout(() => { sheet.querySelector('.cs-content').style.transform = 'translateY(0)'; }, 10);
+}
+
+function closeCollectionSheet() {
+  const sheet = document.getElementById('collection-sheet');
+  if (!sheet) return;
+  sheet.querySelector('.cs-content').style.transform = 'translateY(100%)';
+  setTimeout(() => { sheet.style.display = 'none'; }, 300);
+}
+
+document.getElementById('btn-album-more')?.addEventListener('click', () => {
+  const artistName = albumPageArtist ? albumPageArtist.textContent : '';
+  openCollectionSheet({
+    title: albumPageName.textContent || 'Альбом',
+    subtitle: artistName,
+    cover: albumPageCover.src,
+    getTracks: () => currentAlbumTracks,
+    extra: currentAlbumArtistId
+      ? [{ icon: 'bi-person', text: 'Перейти к артисту', handler: () => openArtist(currentAlbumArtistId) }]
+      : []
+  });
+});
+
+document.getElementById('btn-playlist-more')?.addEventListener('click', () => {
+  openCollectionSheet({
+    title: playlistPageName.textContent || 'Плейлист',
+    subtitle: 'Плейлист',
+    cover: playlistPageCover.src,
+    getTracks: () => currentPlaylistTracks
+  });
+});
+
 // --- Action Sheet (Three Dots) & Playlist Chooser ---
 let activeMenuTrack = null;
 
@@ -4420,57 +4799,7 @@ function openActionSheet(track) {
   if (asReportText) asReportText.textContent = 'Сообщить о цензуре';
 
   const trackId = String(track.track?.id || track.id || '');
-  const artistId = track.track?.artists?.[0]?.id || (Array.isArray(track.artists) ? track.artists[0]?.id : null);
-  // Tracks opened from the player wrap the queue entry (`track.track`), and a
-  // library queue entry in turn wraps the API track (`track.track.track`), so
-  // look through both levels for the album.
-  const albumSource = track.track?.track || track.track || track;
-  const albumId = track.track?.albums?.[0]?.id
-    || albumSource?.albums?.[0]?.id
-    || track.albumId
-    || albumSource?.albumId
-    || (Array.isArray(track.albums) ? track.albums[0]?.id : null)
-    || null;
-
-  // Queue actions (three dots menu)
-  const asBtnPlayNext = document.getElementById('as-btn-play-next');
-  const asBtnQueue = document.getElementById('as-btn-queue');
-  if (asBtnPlayNext) {
-    if (trackId) {
-      asBtnPlayNext.style.display = 'flex';
-      asBtnPlayNext.onclick = () => {
-        closeActionSheet();
-        playNextInQueue(track);
-      };
-    } else {
-      asBtnPlayNext.style.display = 'none';
-    }
-  }
-  if (asBtnQueue) {
-    if (trackId) {
-      asBtnQueue.style.display = 'flex';
-      asBtnQueue.onclick = () => {
-        closeActionSheet();
-        addToQueue(track);
-      };
-    } else {
-      asBtnQueue.style.display = 'none';
-    }
-  }
-
-  // Open the album the track belongs to
-  const asBtnAlbum = document.getElementById('as-btn-album');
-  if (asBtnAlbum) {
-    if (albumId) {
-      asBtnAlbum.style.display = 'flex';
-      asBtnAlbum.onclick = () => {
-        closeActionSheet();
-        openAlbumFromPlayer(albumId);
-      };
-    } else {
-      asBtnAlbum.style.display = 'none';
-    }
-  }
+  const artistId = track.track?.artists?.[0]?.id || (Array.isArray(track.artists) ? track.artists[0]?.id : null) || track.artistId || null;
 
   // Track Vibe (Волна по треку)
   const asBtnTrackVibe = document.getElementById('as-btn-track-vibe');
@@ -4480,6 +4809,52 @@ function openActionSheet(track) {
       closeActionSheet();
       startTrackVibe(track);
     };
+  }
+
+  // Manual queue
+  const asBtnPlayNext = document.getElementById('as-btn-play-next');
+  const asBtnAddQueue = document.getElementById('as-btn-add-queue');
+  const isCurrent = Boolean(trackId && state.currentTrack && String(state.currentTrack.id) === trackId);
+  const showQueueActions = Boolean(trackId) && !isCurrent;
+  if (asBtnPlayNext) {
+    asBtnPlayNext.style.display = showQueueActions ? 'flex' : 'none';
+    asBtnPlayNext.onclick = () => {
+      closeActionSheet();
+      enqueueTracks([track], 'next');
+    };
+  }
+  if (asBtnAddQueue) {
+    asBtnAddQueue.style.display = showQueueActions ? 'flex' : 'none';
+    asBtnAddQueue.onclick = () => {
+      closeActionSheet();
+      enqueueTracks([track], 'end');
+    };
+  }
+
+  // Go to album
+  const asBtnAlbum = document.getElementById('as-btn-album');
+  if (asBtnAlbum) {
+    // Track objects nest: list rows wrap the API track in .track, Wave entries
+    // do the same, and the full player wraps the queue entry once more.
+    let album = null;
+    let albumId = null;
+    for (let t = track, depth = 0; t && typeof t === 'object' && depth < 4; t = t.track, depth++) {
+      if (!album && t.albums?.[0]) album = t.albums[0];
+      if (!albumId && t.albumId) albumId = t.albumId;
+    }
+    albumId = album?.id || albumId || null;
+    const albumView = document.getElementById('view-album');
+    const alreadyThere = albumView && albumView.classList.contains('active') && String(currentAlbumId) === String(albumId);
+    if (albumId && !alreadyThere) {
+      asBtnAlbum.style.display = 'flex';
+      asBtnAlbum.onclick = () => {
+        closeActionSheet();
+        const albumCover = album?.coverUri ? 'https://' + album.coverUri.replace('%%', '400x400') : '';
+        openAlbumFromAnywhere(albumId, album?.title || '', albumCover);
+      };
+    } else {
+      asBtnAlbum.style.display = 'none';
+    }
   }
 
   // Downloads. Both buttons share one handler; only the destination differs.
@@ -5782,8 +6157,8 @@ function getAppVersionInfo() {
   // in AndroidManifest.xml. They previously read 4 / '1.0.3', which made a
   // failed bridge lookup silently claim an ancient version and could hide or
   // fake an update.
-  let versionCode = 56;
-  let versionName = '1.1.34.5';
+  let versionCode = 57;
+  let versionName = '1.1.34.6';
   if (window.AndroidBridge) {
     if (typeof window.AndroidBridge.getVersionCode === 'function') {
       try {

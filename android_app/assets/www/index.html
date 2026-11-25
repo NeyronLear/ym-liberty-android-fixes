@@ -434,6 +434,10 @@
       </div>
       
       <div style="padding: 20px;">
+        <div id="artist-photos-section" style="display: none;">
+          <h2 style="font-size: 20px; margin: 0 0 15px 0;">Фото</h2>
+          <div id="artist-photos-list" style="display: flex; overflow-x: auto; gap: 10px; padding-bottom: 20px; margin-bottom: 20px; border-bottom: 1px solid rgba(255,255,255,0.1); scrollbar-width: none;"></div>
+        </div>
         <h2 style="font-size: 20px; margin: 0 0 15px 0;">Альбомы</h2>
         <div id="artist-albums-list" style="display: flex; overflow-x: auto; gap: 15px; padding-bottom: 20px; margin-bottom: 20px; border-bottom: 1px solid rgba(255,255,255,0.1); scrollbar-width: none;"></div>
         
@@ -461,6 +465,7 @@
           <button class="play-circle-btn" id="btn-album-play" style="width: 54px; height: 54px; border-radius: 50%;">
             <i class="bi bi-play-fill" style="font-size: 26px; margin-left: 2px;"></i>
           </button>
+          <button class="icon-btn collection-more-btn" id="btn-album-more" aria-label="Ещё" style="width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.1);"><i class="bi bi-three-dots"></i></button>
         </div>
       </div>
 
@@ -484,6 +489,7 @@
           <button class="play-circle-btn" id="btn-playlist-play" style="width: 54px; height: 54px; border-radius: 50%;">
             <i class="bi bi-play-fill" style="font-size: 26px; margin-left: 2px;"></i>
           </button>
+          <button class="icon-btn collection-more-btn" id="btn-playlist-more" aria-label="Ещё" style="width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.1);"><i class="bi bi-three-dots"></i></button>
         </div>
       </div>
 
@@ -663,6 +669,12 @@
   </div>
 
     <!-- Action Sheet Modal (Three Dots) -->
+    <div id="photo-viewer" style="position: fixed; inset: 0; z-index: 1100; display: none; background: rgba(0,0,0,0.95);">
+      <div id="photo-viewer-strip" style="display: flex; width: 100%; height: 100%; overflow-x: auto; scroll-snap-type: x mandatory; scrollbar-width: none;"></div>
+      <div id="photo-viewer-counter" style="position: absolute; left: 0; right: 0; bottom: max(24px, calc(var(--safe-bottom, 0px) + 16px)); text-align: center; color: rgba(255,255,255,0.8); font-size: 14px;"></div>
+      <button class="icon-btn" id="photo-viewer-close" aria-label="Закрыть" style="position: absolute; top: max(40px, calc(var(--safe-top, 0px) + 12px)); right: 15px; background: rgba(0,0,0,0.5); border-radius: 50%; width: 40px; height: 40px;"><i class="bi bi-x-lg"></i></button>
+    </div>
+
     <div id="action-sheet" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1000; display: none;">
       <div id="action-sheet-bg" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"></div>
       <div id="action-sheet-content" style="position: absolute; bottom: 0; left: 0; width: 100%; background: var(--surface-color, #1e1e1e); border-top-left-radius: 20px; border-top-right-radius: 20px; padding: 20px; box-sizing: border-box; transform: translateY(100%); transition: transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); max-height: 80vh; overflow-y: auto;">
@@ -675,8 +687,8 @@
         </div>
         <div id="as-actions" style="display: flex; flex-direction: column; gap: 8px;">
           <button class="as-btn" id="as-btn-track-vibe" style="background: transparent; border: none; color: #fff; text-align: left; padding: 12px; font-size: 15px; display: flex; align-items: center; gap: 14px; border-radius: 8px; cursor: pointer;"><i class="bi bi-broadcast" style="font-size: 18px; color: var(--accent-color, #fc3f1d);"></i> <span>Моя Волна по треку</span></button>
-          <button class="as-btn" id="as-btn-play-next" style="background: transparent; border: none; color: #fff; text-align: left; padding: 12px; font-size: 15px; display: flex; align-items: center; gap: 14px; border-radius: 8px; cursor: pointer;"><i class="bi bi-play-fill" style="font-size: 18px;"></i> <span>Играть следующим</span></button>
-          <button class="as-btn" id="as-btn-queue" style="background: transparent; border: none; color: #fff; text-align: left; padding: 12px; font-size: 15px; display: flex; align-items: center; gap: 14px; border-radius: 8px; cursor: pointer;"><i class="bi bi-plus-lg" style="font-size: 18px;"></i> <span>Добавить в очередь</span></button>
+          <button class="as-btn" id="as-btn-play-next" style="background: transparent; border: none; color: #fff; text-align: left; padding: 12px; font-size: 15px; display: flex; align-items: center; gap: 14px; border-radius: 8px; cursor: pointer;"><i class="bi bi-skip-end" style="font-size: 18px;"></i> <span>Играть следующим</span></button>
+          <button class="as-btn" id="as-btn-add-queue" style="background: transparent; border: none; color: #fff; text-align: left; padding: 12px; font-size: 15px; display: flex; align-items: center; gap: 14px; border-radius: 8px; cursor: pointer;"><i class="bi bi-list-ol" style="font-size: 18px;"></i> <span>Добавить в очередь</span></button>
           <button class="as-btn" id="as-btn-like" style="background: transparent; border: none; color: #fff; text-align: left; padding: 12px; font-size: 15px; display: flex; align-items: center; gap: 14px; border-radius: 8px; cursor: pointer;"><i class="bi bi-heart" style="font-size: 18px;"></i> <span id="as-like-text">Добавить в коллекцию</span></button>
           <button class="as-btn" id="as-btn-playlist" style="background: transparent; border: none; color: #fff; text-align: left; padding: 12px; font-size: 15px; display: flex; align-items: center; gap: 14px; border-radius: 8px; cursor: pointer;"><i class="bi bi-music-note-list" style="font-size: 18px;"></i> <span>Добавить в плейлист</span></button>
           <button class="as-btn" id="as-btn-download" style="background: transparent; border: none; color: #fff; text-align: left; padding: 12px; font-size: 15px; display: flex; align-items: center; gap: 14px; border-radius: 8px; cursor: pointer;"><i class="bi bi-download" style="font-size: 18px;"></i> <span id="as-download-text">Скачать трек</span></button>

@@ -725,14 +725,55 @@ const YandexClient = {
     }));
 
     const artistCover = artist.cover?.uri ? 'https://' + artist.cover.uri.replace('%%', '1000x1000') : '';
+    // brief-info carries every artist photo in allCovers; artist.cover is just
+    // the first of them.
+    const photos = [];
+    (data.result?.allCovers || []).forEach(c => {
+      if (!c || !c.uri) return;
+      const url = 'https://' + c.uri.replace('%%', '1000x1000');
+      if (!photos.includes(url)) photos.push(url);
+    });
+    if (artistCover && !photos.includes(artistCover)) photos.unshift(artistCover);
 
     return {
       id: artist.id,
       name: artist.name,
       coverUri: artistCover,
+      photos,
       tracks: popularTracks,
       albums
     };
+  },
+
+  // Every track of an artist, most popular first: the same order brief-info
+  // uses for its ten popularTracks. Paged: returns { tracks, total, page }.
+  async getArtistTracks(artistId, token, page = 0, pageSize = 100) {
+    const [res, libertyTracks] = await Promise.all([
+      fetch(`https://api.music.yandex.net/artists/${artistId}/tracks?page=${page}&page-size=${pageSize}`, { headers: this.getHeaders(token) }),
+      this.getLibertyList()
+    ]);
+    if (!res.ok) throw new Error('artist tracks HTTP ' + res.status);
+    const data = await res.json();
+    const tracks = (data.result?.tracks || []).map(t => {
+      const cover = t.coverUri
+        ? 'https://' + t.coverUri.replace('%%', '400x400')
+        : t.albums?.[0]?.coverUri
+        ? 'https://' + t.albums[0].coverUri.replace('%%', '400x400')
+        : '';
+      return {
+        id: t.id,
+        title: t.title,
+        version: t.version || '',
+        artists: (t.artists || []).map(a => a.name).join(', '),
+        durationMs: t.durationMs || 0,
+        coverUri: cover,
+        explicit: Boolean(t.contentWarning === 'explicit' || t.explicit),
+        isLiberty: Boolean(libertyTracks && libertyTracks[String(t.id)]),
+        track: t
+      };
+    });
+    const pager = data.result?.pager || {};
+    return { tracks, total: Number(pager.total) || tracks.length, page };
   },
 
   async getAlbum(albumId, token) {
