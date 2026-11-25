@@ -40,6 +40,67 @@ const PLACEHOLDER_COVER = 'favicon.png';
   stats.parentNode.insertBefore(hub, stats);
 })();
 
+// Queue helpers used by the "three dots" action sheet
+function isTrackInQueue(trackId) {
+  if (!Array.isArray(state.queue)) return -1;
+  const id = String(trackId);
+  return state.queue.findIndex(t => t && String(t.id) === id);
+}
+
+// A queue edit changes what "next" means, so the audio preloaded for the old
+// order must be dropped. Otherwise the crossfade would still play the track
+// that was next before "Играть следующим" inserted another one.
+function refreshAfterQueueChange() {
+  if (typeof dropStalePreload === 'function') dropStalePreload();
+  if (typeof preloadNextTrack === 'function') preloadNextTrack();
+  if (typeof savePlaybackState === 'function') savePlaybackState(true);
+}
+
+function addToQueue(track) {
+  if (!track || track.id == null) return;
+  if (!Array.isArray(state.queue)) state.queue = [];
+  if (isTrackInQueue(track.id) !== -1) {
+    if (typeof showToast === 'function') showToast('Трек уже в очереди', 'bi-info-circle');
+    return;
+  }
+  state.queue.push(track);
+  refreshAfterQueueChange();
+  if (typeof showToast === 'function') showToast('Добавлено в очередь', 'bi-check-circle');
+}
+
+function playNextInQueue(track) {
+  if (!track || track.id == null) return;
+  if (!Array.isArray(state.queue)) state.queue = [];
+
+  const id = String(track.id);
+  if (state.currentTrack && String(state.currentTrack.id) === id) {
+    if (typeof showToast === 'function') showToast('Этот трек уже играет', 'bi-info-circle');
+    return;
+  }
+
+  const existing = isTrackInQueue(id);
+  if (existing !== -1) state.queue.splice(existing, 1);
+
+  let base = typeof state.queueIndex === 'number' ? state.queueIndex : -1;
+  if (existing !== -1 && existing < base) base -= 1;
+
+  // Nothing is playing: start the track immediately instead of silently queueing it.
+  if (!state.currentTrack || state.queue.length === 0) {
+    state.queue.push(track);
+    state.queueIndex = state.queue.length - 1;
+    playQueueTrack(track);
+    return;
+  }
+
+  const insertAt = Math.min(Math.max(base + 1, 0), state.queue.length);
+  state.queue.splice(insertAt, 0, track);
+  // With shuffle on, the next track is taken from nextShuffleIndex, so point it
+  // at the freshly inserted track to honour "Играть следующим".
+  if (state.isShuffle && state.queueMode !== 'vibe') state.nextShuffleIndex = insertAt;
+  refreshAfterQueueChange();
+  if (typeof showToast === 'function') showToast('Будет играть следующим', 'bi-play-circle');
+}
+
 // --- DOM Elements ---
 const dom = {
   navBtns: document.querySelectorAll('.nav-btn'),
@@ -141,6 +202,11 @@ const state = {
   playbackContext: { subtitle: 'ИГРАЕТ ИЗ ВОЛНЫ', title: 'Моя Волна' },
   vibeBatchId: null, // For fetching next vibe tracks
   vibeBatchByTrack: {}, // trackId -> batchId it was recommended in (correct feedback attribution)
+  // Rotor station continuation cursor: the last track id the station sent.
+  // `user:onyourwave` and `track:<id>` are different stations, so the cursor is
+  // tagged with the station it belongs to and dropped when the station changes.
+  vibeCursor: null,
+  vibeCursorStation: null,
   isFetchingVibe: false,
   // Bumped on every mood-chip switch. A vibe fetch that started before the
   // bump carries the old mood's recommendations, so its result is discarded
@@ -212,6 +278,13 @@ function openArtistFromPlayer(artistId) {
   const fromPlayer = !dom.fullPlayer.classList.contains('translateY-100');
   dom.fullPlayer.classList.add('translateY-100');
   openArtist(artistId);
+  if (fromPlayer) state.returnToPlayerDepth = state.viewHistory.length;
+}
+
+function openAlbumFromPlayer(albumId) {
+  const fromPlayer = !dom.fullPlayer.classList.contains('translateY-100');
+  dom.fullPlayer.classList.add('translateY-100');
+  openAlbum(albumId);
   if (fromPlayer) state.returnToPlayerDepth = state.viewHistory.length;
 }
 
@@ -1116,13 +1189,30 @@ function finishCrossfade(outgoingPlayer, incomingPlayer, nextTrackInfo) {
     }
   }
 
+  // The outgoing player's pause event above reported "paused" to the native
+  // MediaSession. Flip to playing BEFORE updateTrackUI() (it syncs the
+  // notification) and push an explicit sync afterwards. Without this the
+  // foreground service kept mIsPlaying=false after every crossfade, released
+  // its wake lock and stopped itself five minutes later — playback died in the
+  // background in the middle of a Wave.
+  state.isPlaying = true;
   const targetTrack = nextTrackInfo || state.queue[state.queueIndex];
   if (targetTrack) {
     updateTrackUI(targetTrack);
   }
-
-  state.isPlaying = true;
   updatePlayButtons();
+  syncNativeMedia(
+    state.currentTrack?.title,
+    state.currentTrack?.artist,
+    true,
+    (activePlayer.currentTime || 0) * 1000,
+    (activePlayer.duration || 0) * 1000,
+    state.currentTrack?.cover
+  );
+  // The outgoing player's pause handler above persisted the *old* track/index
+  // a few lines earlier. Save the post-swap state now so a kill right after the
+  // transition resumes the track that is actually playing.
+  try { savePlaybackState(true); } catch (_) {}
   setTimeout(preloadNextTrack, 600);
 }
 
@@ -1155,13 +1245,27 @@ async function playNext(isUserSkip = true) {
       if (state.queueIndex >= state.queue.length) {
         // Fallback: fetch a fresh batch directly so continuous playback never
         // falls back to track 0. Must be deduped too — this is exactly the
-        // moment a naive concat() would loop the queue.
+        // moment a naive concat() would loop the queue. The cursor is already
+        // at the end of the previous batch, so this asks Rotor for what comes
+        // after it (and keeps advancing if several batches are known).
         try {
-          const freshData = await YandexClient.getVibe(state.token, null, state.currentStation || 'user:onyourwave');
+          const station = state.currentStation || 'user:onyourwave';
           const existingIds = new Set(state.queue.map(t => String(t.id)));
-          const extra = dedupeVibeBatch(freshData && freshData.tracks, existingIds);
+          const currentTr = state.currentTrack || state.queue[state.queueIndex];
+          const loaded = await loadVibeTracksFromRotor({
+            station,
+            anchor: currentTr ? currentTr.id : getVibeCursor(station),
+            excludeIds: existingIds,
+            minFresh: 5,
+            maxRequests: 3
+          });
+          applyVibeLoad(loaded, station);
+          let extra = loaded.tracks;
+          if (extra.length === 0 && loaded.pool.length > 0) {
+            extra = leastRecentlyPlayedVibeTracks(loaded.pool, existingIds, 10);
+          }
           if (extra.length > 0) {
-            rememberVibeBatch(extra, freshData && freshData.batchId);
+            ensureVibeBatch(extra, loaded.data && loaded.data.batchId);
             state.queue = state.queue.concat(extra);
           }
         } catch(e) {}
@@ -1697,6 +1801,10 @@ function savePlaybackState(force = false) {
       // Persist batch attribution so feedback keeps working right after a restart.
       vibeBatchId: state.vibeBatchId || null,
       vibeBatchByTrack: state.vibeBatchByTrack || {},
+      // Rotor continuation point: after a restart the refill must continue the
+      // station instead of re-reading the batch we already queued.
+      vibeCursor: state.vibeCursor || null,
+      vibeCursorStation: state.vibeCursorStation || null,
       isShuffle: !!state.isShuffle,
       repeatMode: state.repeatMode || 'off',
       timestamp: now
@@ -1743,6 +1851,8 @@ function restorePlaybackState() {
     // a restart (the gate in sendFeedback needs a batch id).
     state.vibeBatchId = session.vibeBatchId || null;
     state.vibeBatchByTrack = session.vibeBatchByTrack || {};
+    state.vibeCursor = session.vibeCursor || null;
+    state.vibeCursorStation = session.vibeCursorStation || null;
     if (session.playbackContext) {
       state.playbackContext = session.playbackContext;
       updatePlaybackContextHeader(session.playbackContext.subtitle, session.playbackContext.title);
@@ -2291,6 +2401,26 @@ setInterval(() => {
   }
 }, 5000);
 
+// Keep the native foreground service in sync while audio is really running.
+// A missed state update (track change, crossfade, audio focus) used to leave the
+// service thinking playback was paused: it released the wake lock and stopped
+// itself after five minutes, which killed background playback. A cheap
+// heartbeat also refreshes the seek bar in the notification. Timers may be
+// throttled in the background, but well under the service's five-minute idle
+// timeout.
+setInterval(() => {
+  if (!state.isPlaying) return;
+  if (!activePlayer || activePlayer.paused || !activePlayer.getAttribute('src')) return;
+  syncNativeMedia(
+    state.currentTrack?.title,
+    state.currentTrack?.artist,
+    true,
+    (activePlayer.currentTime || 0) * 1000,
+    (activePlayer.duration || 0) * 1000,
+    state.currentTrack?.cover
+  );
+}, 20000);
+
 async function resumePlayback() {
   if (!state.currentTrack || !state.currentTrack.id) return false;
   if (activePlayer.getAttribute('src') && !activePlayer.error) {
@@ -2414,9 +2544,10 @@ state.vibeHistory = loadVibeHistory();
 
 // --- Anti-loop deduplication engine ---
 // Rotor is free to recommend a track we already played. We keep a persisted,
-// ordered history and never enqueue anything that is in it, unless the whole
-// candidate batch is already known — then we fall back to the least-recently
-// played candidates so playback never stalls.
+// ordered history and never enqueue anything that is in it. When a whole batch
+// is already known, we advance the Rotor cursor and ask again instead of
+// replaying it — a repeated batch means the station is stuck, not that there is
+// no more music.
 const VIBE_DEDUP_LIMIT = 1000; // how many history ids we consider "recent enough" to avoid
 
 function vibeHistoryAdd(trackId) {
@@ -2438,9 +2569,13 @@ function vibeIsKnown(trackId) {
 }
 
 /**
- * Filter a freshly fetched Rotor batch against everything we must not repeat.
+ * Strict filter: every track already played (within `lookback`) or explicitly
+ * excluded (queue / seed) is dropped. Returns [] when Rotor only sent repeats;
+ * callers then decide how far to relax. Keeping the strict and relaxed paths
+ * separate matters: the old fallback silently returned the repeated batch, so
+ * the Wave kept cycling through the same handful of songs.
  * @param {Array} candidates raw normalised tracks from YandexClient.getVibe
- * @param {Set<string>} extraIds additional ids to exclude (e.g. current queue)
+ * @param {Set<string>|Array<string>} extraIds additional ids to exclude (e.g. current queue)
  * @param {number} lookback how many trailing history entries count as "too recent"
  */
 function dedupeVibeBatch(candidates, extraIds, lookback = VIBE_DEDUP_LIMIT) {
@@ -2452,18 +2587,53 @@ function dedupeVibeBatch(candidates, extraIds, lookback = VIBE_DEDUP_LIMIT) {
   const blocked = new Set(recent);
   if (extraIds) extraIds.forEach(id => blocked.add(String(id)));
 
-  let fresh = list.filter(t => !blocked.has(String(t.id)));
-  if (fresh.length > 0) return fresh;
+  const seen = new Set();
+  return list.filter(t => {
+    const id = String(t.id);
+    if (blocked.has(id) || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
 
-  // Everything is a repeat. Relax in stages so playback keeps going, but always
-  // prefer the candidates we have not heard for the longest time (they are at
-  // the head of the history array, so a plain order-preserving filter scores best).
-  const older = new Set(historyArr.slice(0, Math.max(0, historyArr.length - lookback)).map(String));
-  fresh = list.filter(t => !older.has(String(t.id)));
-  if (fresh.length > 0) return fresh;
+/**
+ * Last-resort ordering used only when Rotor itself keeps returning known tracks:
+ * tracks heard longest ago (or never heard) go first, so a forced replay never
+ * replays the current queue or the immediately previous tracks.
+ */
+function leastRecentlyPlayedVibeTracks(candidates, extraIds, limit = 20) {
+  const list = Array.isArray(candidates) ? candidates.filter(t => t && t.id) : [];
+  if (list.length === 0) return [];
 
-  // Absolute last resort: only avoid the track that is playing right now.
-  return list;
+  const blocked = new Set();
+  if (extraIds) extraIds.forEach(id => blocked.add(String(id)));
+  const historyPos = new Map();
+  Array.from(state.vibeHistory || []).forEach((id, idx) => historyPos.set(String(id), idx));
+
+  const seen = new Set();
+  return list
+    .filter(t => {
+      const id = String(t.id);
+      if (blocked.has(id) || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    })
+    .map((track, order) => {
+      const id = String(track.id);
+      // Never played => -1, sorted before the oldest history entry.
+      const rank = historyPos.has(id) ? historyPos.get(id) : -1;
+      return { track, rank, order };
+    })
+    .sort((a, b) => (a.rank - b.rank) || (a.order - b.order))
+    .slice(0, Math.max(1, limit))
+    .map(item => item.track);
+}
+
+// Numeric object keys are enumerated in ascending order, not insertion order, so
+// pruning Object.keys() would drop the lowest track ids instead of the oldest
+// entries. Prefixing keeps the map ordered by the moment a track was seen.
+function vibeBatchKey(trackId) {
+  return 't' + String(trackId);
 }
 
 function rememberVibeBatch(tracks, batchId) {
@@ -2471,14 +2641,151 @@ function rememberVibeBatch(tracks, batchId) {
   state.vibeBatchId = batchId;
   state.vibeBatchByTrack = state.vibeBatchByTrack || {};
   (tracks || []).forEach(t => {
-    if (t && t.id) state.vibeBatchByTrack[String(t.id)] = batchId;
+    if (!t || !t.id) return;
+    const key = vibeBatchKey(t.id);
+    // Re-inserting moves the key to the tail, so pruning below removes the
+    // least recently attributed tracks first.
+    delete state.vibeBatchByTrack[key];
+    state.vibeBatchByTrack[key] = batchId;
   });
+  // Attribution is persisted with the session; without pruning the map grows
+  // with every wave refill until localStorage starts throwing quota errors.
+  const keys = Object.keys(state.vibeBatchByTrack);
+  if (keys.length > VIBE_DEDUP_LIMIT) {
+    keys.slice(0, keys.length - VIBE_DEDUP_LIMIT).forEach(k => {
+      delete state.vibeBatchByTrack[k];
+    });
+  }
+}
+
+// Attribute tracks that do not have a batch id yet (e.g. forced replay from the
+// fallback pool) without overwriting the correct id of tracks from other batches.
+function rememberdVibeBatchId(trackId) {
+  if (!trackId) return null;
+  const byTrack = state.vibeBatchByTrack || {};
+  return byTrack[vibeBatchKey(trackId)]
+    // Plain numeric keys come from sessions saved before the prefixed keys.
+    || byTrack[String(trackId)]
+    || null;
+}
+
+function ensureVibeBatch(tracks, batchId) {
+  if (!batchId) return;
+  const missing = (tracks || []).filter(t => t && t.id && !rememberdVibeBatchId(t.id));
+  if (missing.length) rememberVibeBatch(missing, batchId);
 }
 
 function vibeBatchForTrack(trackId) {
-  const byTrack = state.vibeBatchByTrack || {};
-  if (trackId && byTrack[String(trackId)]) return byTrack[String(trackId)];
-  return state.vibeBatchId || null;
+  if (!trackId) return state.vibeBatchId || null;
+  return rememberdVibeBatchId(trackId) || state.vibeBatchId || null;
+}
+
+// --- Rotor continuation cursor ---
+// `queue=<trackId>` is the track Rotor should continue AFTER. The first request
+// of a refill uses the track that is actually playing, as the API documents.
+// When the station answers with an already-known window (the usual cause of
+// "the Wave repeats itself"), the loader walks forward through the chain using
+// the last track of each raw response instead of replaying that window.
+function getVibeCursor(station) {
+  const cleanStation = station || 'user:onyourwave';
+  if (state.vibeCursorStation && state.vibeCursorStation !== cleanStation) return null;
+  return state.vibeCursor || null;
+}
+
+function setVibeCursor(station, trackId) {
+  state.vibeCursorStation = station || 'user:onyourwave';
+  state.vibeCursor = trackId ? String(trackId) : null;
+}
+
+/**
+ * Pull consecutive Rotor batches until `minFresh` unheard tracks are collected
+ * or the station stops advancing. Each request moves the cursor to the last
+ * track of the raw response, so a fully-known batch merely makes us ask one step
+ * further instead of ending (or looping) the Wave.
+ *
+ * Deliberately side-effect free: the cursor and batch attribution are returned
+ * and only applied by the caller once it knows the response still belongs to the
+ * current session/mood. Writing them here let a slow, already-superseded request
+ * move the live cursor and misattribute feedback.
+ * @returns {Promise<{tracks: Array, pool: Array, data: Object|null, cursor: string|null, batches: Array<{batchId: string, tracks: Array}>}>}
+ */
+async function loadVibeTracksFromRotor(options = {}) {
+  const station = options.station || 'user:onyourwave';
+  const maxRequests = Math.max(1, options.maxRequests || 3);
+  const minFresh = Math.max(1, options.minFresh || 5);
+  const lookback = options.lookback || VIBE_DEDUP_LIMIT;
+
+  const excludeIds = new Set();
+  if (options.excludeIds) options.excludeIds.forEach(id => excludeIds.add(String(id)));
+
+  let cursor = options.anchor !== undefined ? options.anchor : getVibeCursor(station);
+  if (cursor) cursor = String(cursor);
+
+  const fresh = [];
+  const pool = [];
+  const batches = [];
+  const poolIds = new Set();
+  const visitedCursors = new Set();
+  let lastData = null;
+
+  for (let attempt = 0; attempt < maxRequests; attempt++) {
+    if (cursor && visitedCursors.has(cursor)) break;
+    if (cursor) visitedCursors.add(cursor);
+
+    let data;
+    try {
+      data = await YandexClient.getVibe(state.token, cursor, station);
+    } catch (e) {
+      // The first request must surface the error (startVibe shows a toast);
+      // a failed continuation retry just stops the loop with what we have.
+      if (attempt === 0) throw e;
+      break;
+    }
+    if (!data) break;
+    lastData = data;
+
+    const raw = Array.isArray(data.tracks) ? data.tracks : [];
+    raw.forEach(t => {
+      if (!t || !t.id) return;
+      const id = String(t.id);
+      if (poolIds.has(id)) return;
+      poolIds.add(id);
+      pool.push(t);
+    });
+
+    const batchFresh = dedupeVibeBatch(raw, excludeIds, lookback);
+    batchFresh.forEach(t => {
+      const id = String(t.id);
+      if (excludeIds.has(id)) return;
+      excludeIds.add(id);
+      fresh.push(t);
+    });
+    if (data.batchId) batches.push({ batchId: data.batchId, tracks: batchFresh });
+
+    // Rotor's own last id is authoritative (it may account for service items
+    // we filtered out); the raw last track is the fallback for the local API,
+    // which does not return lastTrackId.
+    const nextCursor = data.lastTrackId
+      ? String(data.lastTrackId)
+      : (raw.length ? String(raw[raw.length - 1].id) : null);
+
+    if (!nextCursor || (cursor && nextCursor === cursor)) break;
+    cursor = nextCursor;
+
+    if (fresh.length >= minFresh) break;
+  }
+
+  return { tracks: fresh, pool, data: lastData, cursor, batches };
+}
+
+// Commit a completed Rotor load to the live session state. Callers must only do
+// this after their staleness check (mood/session generation).
+function applyVibeLoad(loaded, station) {
+  if (!loaded) return;
+  if (loaded.cursor) setVibeCursor(station || 'user:onyourwave', loaded.cursor);
+  (loaded.batches || []).forEach(batch => {
+    rememberVibeBatch(batch.tracks, batch.batchId);
+  });
 }
 
 async function startVibe() {
@@ -2492,25 +2799,51 @@ async function startVibe() {
   // Otherwise, stop current track and start a fresh Vibe session
   activePlayer.pause();
   state.currentStation = 'user:onyourwave';
+  // Invalidate refills that are still in flight for the previous session, so
+  // they cannot append their tracks to the queue we are about to build. The
+  // returned value also marks this session: a slower, older startVibe()/
+  // startTrackVibe()/mood switch must not overwrite the newer one below.
+  const sessionSeq = ++state.moodRequestSeq;
+  state.vibeBatchId = null;
+  state.vibeBatchByTrack = {};
+  // A new session starts from the station's current position, not from a
+  // cursor that belonged to the queue we are abandoning.
+  setVibeCursor('user:onyourwave', null);
   updatePlaybackContextHeader('ИГРАЕТ ИЗ ВОЛНЫ', 'Моя Волна');
   dom.vibePlayBtn.innerHTML = '<i class="bi bi-hourglass-split"></i>';
   
   try {
-    let data = await YandexClient.getVibe(state.token, null, 'user:onyourwave');
-    
-    if (data.shadowbanned) {
+    // Ask for several consecutive batches if the first ones are already known.
+    const loaded = await loadVibeTracksFromRotor({
+      station: 'user:onyourwave',
+      anchor: null,
+      minFresh: 8,
+      maxRequests: 4
+    });
+    if (sessionSeq !== state.moodRequestSeq) {
+      // Another session started while Rotor was answering; let it own the UI.
+      updatePlayButtons();
+      return;
+    }
+    applyVibeLoad(loaded, 'user:onyourwave');
+    const data = loaded.data;
+
+    if (data && data.shadowbanned && loaded.tracks.length === 0 && loaded.pool.length === 0) {
       showToast('Яндекс ограничил аккаунт. Попробуйте сменить станцию', 'bi-exclamation-triangle');
       dom.vibePlayBtn.innerHTML = '<i class="bi bi-play-fill"></i>';
       return;
     }
-    
-    let tracks = data.tracks || [];
-    // Avoid everything already played. Falls back gracefully inside the helper.
-    let freshTracks = dedupeVibeBatch(tracks, null, VIBE_DEDUP_LIMIT);
+
+    // Last resort: every batch Rotor sent is already in the history. Play the
+    // tracks we heard longest ago instead of the same recent ones again.
+    let freshTracks = loaded.tracks;
+    if (freshTracks.length === 0 && loaded.pool.length > 0) {
+      freshTracks = leastRecentlyPlayedVibeTracks(loaded.pool, null, 10);
+      ensureVibeBatch(freshTracks, data && data.batchId);
+    }
     
     if (freshTracks.length > 0) {
       state.queueMode = 'vibe';
-      rememberVibeBatch(freshTracks, data.batchId);
       state.queue = freshTracks;
       state.queueIndex = 0;
       
@@ -2529,6 +2862,7 @@ async function startVibe() {
       dom.vibePlayBtn.innerHTML = '<i class="bi bi-play-fill"></i>';
     }
   } catch (e) {
+    if (sessionSeq !== state.moodRequestSeq) return; // superseded; do not show its error
     console.error("Vibe start error", e);
     showToast('Ошибка загрузки Волны', 'bi-exclamation-circle');
     dom.vibePlayBtn.innerHTML = '<i class="bi bi-play-fill"></i>';
@@ -2544,32 +2878,32 @@ async function fetchMoreVibeTracks() {
   const requestSeq = state.moodRequestSeq;
   try {
     const station = state.currentStation || 'user:onyourwave';
-    // Use the track that actually played/is playing (registered with Rotor feedback)
-    const currentTr = state.currentTrack || state.queue[state.queueIndex];
-    const trackForQueue = currentTr ? currentTr.id : null;
-    let data = await YandexClient.getVibe(state.token, trackForQueue, station);
-    if (requestSeq !== state.moodRequestSeq) return;
-
     const existingIds = new Set(state.queue.map(t => String(t.id)));
-    let freshTracks = dedupeVibeBatch(data && data.tracks, existingIds);
+    // Rotor's documented anchor is the track that was playing before the new
+    // ones (`queue=<trackId>`). A stale window answered for the same anchor is
+    // then advanced past inside the helper, using the tail of each response.
+    const currentTr = state.currentTrack || state.queue[state.queueIndex];
+    const anchor = currentTr ? currentTr.id : getVibeCursor(station);
 
-    // If Rotor returned duplicates, request fresh recommendation batch without queue
-    if (freshTracks.length === 0) {
-      data = await YandexClient.getVibe(state.token, null, station);
-      if (requestSeq !== state.moodRequestSeq) return;
-      freshTracks = dedupeVibeBatch(data && data.tracks, existingIds);
-    }
+    const loaded = await loadVibeTracksFromRotor({
+      station,
+      anchor,
+      excludeIds: existingIds,
+      minFresh: 5,
+      maxRequests: 3
+    });
+    if (requestSeq !== state.moodRequestSeq) return;
+    applyVibeLoad(loaded, station);
 
-    // If still empty, ask with a seeded queue anchored on an older track
-    if (freshTracks.length === 0) {
-      const anchor = state.queue[Math.max(0, state.queueIndex - 5)];
-      data = await YandexClient.getVibe(state.token, anchor ? anchor.id : null, station);
-      if (requestSeq !== state.moodRequestSeq) return;
-      freshTracks = dedupeVibeBatch(data && data.tracks, existingIds);
+    let freshTracks = loaded.tracks;
+    if (freshTracks.length === 0 && loaded.pool.length > 0) {
+      // Rotor insists on repeats. Append the least recently played ones so the
+      // wave keeps going, but never tracks that are already in the queue.
+      freshTracks = leastRecentlyPlayedVibeTracks(loaded.pool, existingIds, 10);
+      ensureVibeBatch(freshTracks, loaded.data && loaded.data.batchId);
     }
 
     if (freshTracks.length > 0) {
-      rememberVibeBatch(freshTracks, data && data.batchId);
       state.queue = state.queue.concat(freshTracks);
       // Prune played tracks far in the past to avoid unbounded queue growth.
       // History (persisted, 1000 entries) is what actually prevents repeats,
@@ -2614,17 +2948,36 @@ async function startTrackVibe(seedTrack) {
   }
   state.queueMode = 'vibe';
   state.currentStation = 'track:' + trackId;
+  // Abandon refills that belong to the previous station/mood. The returned
+  // value marks this session so a slower, older request cannot take over.
+  const sessionSeq = ++state.moodRequestSeq;
+  state.vibeBatchId = null;
+  state.vibeBatchByTrack = {};
+  setVibeCursor(state.currentStation, null);
   updatePlaybackContextHeader('ВОЛНА ПО ТРЕКУ', trackTitle);
   showToast(`Запущена Волна по треку: ${trackTitle}`);
 
   try {
-    const data = await YandexClient.getVibe(state.token, null, state.currentStation);
-    if (data.shadowbanned) {
+    // A track station is independent of "Моя Волна": give it its own cursor
+    // (set above) and advance through known batches like the main wave.
+    const loaded = await loadVibeTracksFromRotor({
+      station: state.currentStation,
+      anchor: null,
+      excludeIds: [String(trackId)],
+      minFresh: 8,
+      maxRequests: 3,
+      lookback: 100
+    });
+    if (sessionSeq !== state.moodRequestSeq) return; // a newer session won
+    applyVibeLoad(loaded, state.currentStation);
+    // The seed track itself is never part of the response, so attribute feedback
+    // for it to the first batch of the chain — that is the batch Rotor built
+    // around this very track.
+    ensureVibeBatch([{ id: trackId }], loaded.batches[0] && loaded.batches[0].batchId);
+    const data = loaded.data;
+    if (data && data.shadowbanned && loaded.tracks.length === 0 && loaded.pool.length === 0) {
       showToast('Яндекс вернул пустую Волну');
     }
-
-    state.vibeBatchByTrack = {};
-    rememberVibeBatch([{ id: trackId }], data.batchId);
 
     let coverUrl = seedTrack.coverUri || rawTrack.coverUri || '';
     if (coverUrl.includes('%%')) coverUrl = `https://${coverUrl.replace('%%', '400x400')}`;
@@ -2646,9 +2999,11 @@ async function startTrackVibe(seedTrack) {
     };
 
     // The seed track is intentionally first, so exclude it before deduping.
-    const excluded = new Set([String(trackId)]);
-    let waveTracks = dedupeVibeBatch(data.tracks, excluded, 100);
-    rememberVibeBatch(waveTracks, data.batchId);
+    let waveTracks = loaded.tracks;
+    if (waveTracks.length === 0 && loaded.pool.length > 0) {
+      waveTracks = leastRecentlyPlayedVibeTracks(loaded.pool, [String(trackId)], 10);
+    }
+    ensureVibeBatch(waveTracks, data && data.batchId);
     state.queue = [initialTrack, ...waveTracks];
     state.queueIndex = 0;
 
@@ -2662,6 +3017,7 @@ async function startTrackVibe(seedTrack) {
       playQueueTrack(initialTrack);
     }
   } catch (err) {
+    if (sessionSeq !== state.moodRequestSeq) return; // a newer session took over
     console.error('Error starting track wave:', err);
     showToast('Ошибка запуска Волны по треку');
     state.queue = [seedTrack];
@@ -3054,6 +3410,7 @@ if (btnPlaylistPlay) {
 }
 
 async function openArtist(id) {
+  state.currentArtistId = String(id);
   navigateToView('view-artist');
   artistPageName.textContent = "Загрузка...";
   artistTracksList.innerHTML = '<div style="text-align:center; padding: 20px;">Загрузка...</div>';
@@ -4064,6 +4421,56 @@ function openActionSheet(track) {
 
   const trackId = String(track.track?.id || track.id || '');
   const artistId = track.track?.artists?.[0]?.id || (Array.isArray(track.artists) ? track.artists[0]?.id : null);
+  // Tracks opened from the player wrap the queue entry (`track.track`), and a
+  // library queue entry in turn wraps the API track (`track.track.track`), so
+  // look through both levels for the album.
+  const albumSource = track.track?.track || track.track || track;
+  const albumId = track.track?.albums?.[0]?.id
+    || albumSource?.albums?.[0]?.id
+    || track.albumId
+    || albumSource?.albumId
+    || (Array.isArray(track.albums) ? track.albums[0]?.id : null)
+    || null;
+
+  // Queue actions (three dots menu)
+  const asBtnPlayNext = document.getElementById('as-btn-play-next');
+  const asBtnQueue = document.getElementById('as-btn-queue');
+  if (asBtnPlayNext) {
+    if (trackId) {
+      asBtnPlayNext.style.display = 'flex';
+      asBtnPlayNext.onclick = () => {
+        closeActionSheet();
+        playNextInQueue(track);
+      };
+    } else {
+      asBtnPlayNext.style.display = 'none';
+    }
+  }
+  if (asBtnQueue) {
+    if (trackId) {
+      asBtnQueue.style.display = 'flex';
+      asBtnQueue.onclick = () => {
+        closeActionSheet();
+        addToQueue(track);
+      };
+    } else {
+      asBtnQueue.style.display = 'none';
+    }
+  }
+
+  // Open the album the track belongs to
+  const asBtnAlbum = document.getElementById('as-btn-album');
+  if (asBtnAlbum) {
+    if (albumId) {
+      asBtnAlbum.style.display = 'flex';
+      asBtnAlbum.onclick = () => {
+        closeActionSheet();
+        openAlbumFromPlayer(albumId);
+      };
+    } else {
+      asBtnAlbum.style.display = 'none';
+    }
+  }
 
   // Track Vibe (Волна по треку)
   const asBtnTrackVibe = document.getElementById('as-btn-track-vibe');
@@ -4363,6 +4770,36 @@ document.addEventListener('click', (e) => {
     openActionSheet(trackData);
   }
 });
+
+// Clicking the artist name inside a track card opens the artist page.
+// Capture phase so the track card's own "play" handler does not also fire.
+document.addEventListener('click', (e) => {
+  const artistEl = e.target.closest && e.target.closest('.track-artist');
+  if (!artistEl) return;
+  const trackItem = artistEl.closest('.track-item');
+  if (!trackItem || !trackItem._trackData) return;
+
+  const track = trackItem._trackData;
+  const raw = track.track || track;
+  const artistId = track.artistId
+    || (raw && raw.artistId)
+    || (raw && Array.isArray(raw.artists) && raw.artists[0] && raw.artists[0].id)
+    || (Array.isArray(track.artists) && track.artists[0] && track.artists[0].id)
+    || null;
+  if (!artistId) return;
+
+  // Already looking at this artist: do not push the same page onto
+  // viewHistory again (Back would otherwise need extra taps).
+  const artistView = document.getElementById('view-artist');
+  if (artistView && artistView.classList.contains('active')
+      && String(state.currentArtistId) === String(artistId)) {
+    return;
+  }
+
+  e.preventDefault();
+  e.stopPropagation();
+  openArtistFromPlayer(artistId);
+}, true);
 
 // ==========================================
 // Wave Screen Stats & Moods + Cloud Account Sync
@@ -4742,8 +5179,14 @@ async function syncWaveHistoryPlaylist() {
           // so reverse it to get the chronological order the dedup engine expects.
           const ordered = plData.tracks.slice().reverse();
           ordered.forEach(tr => {
-            if (tr && tr.id) state.vibeHistory.add(String(tr.id));
-            if (tr && tr.id) syncedTrackIds.add(String(tr.id));
+            if (!tr || !tr.id) return;
+            const id = String(tr.id);
+            // Re-insert at the tail: a plain Set.add() would keep a locally
+            // known id at its old position and corrupt the "least recently
+            // played" ordering the fallback relies on.
+            state.vibeHistory.delete(id);
+            state.vibeHistory.add(id);
+            syncedTrackIds.add(id);
           });
           // Trim to the dedup window, keeping the most recent entries.
           while (state.vibeHistory.size > VIBE_DEDUP_LIMIT) {
@@ -4877,9 +5320,25 @@ function syncVibeMoodUI(moodName) {
     if (text === targetMood) {
       chip.classList.add('active');
       matched = true;
-      try {
-        chip.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
-      } catch (e) {}
+      // Scroll only the chips strip itself. `scrollIntoView` can also scroll the
+      // surrounding `.view` (overflow-x: hidden still allows programmatic
+      // scrolling), which visibly shifts the whole screen sideways.
+      const strip = chip.closest('.vibe-mood-chips');
+      if (strip) {
+        const stripRect = strip.getBoundingClientRect();
+        const chipRect = chip.getBoundingClientRect();
+        const target = strip.scrollLeft + (chipRect.left - stripRect.left)
+          - (strip.clientWidth - chipRect.width) / 2;
+        const maxLeft = Math.max(0, strip.scrollWidth - strip.clientWidth);
+        const left = Math.min(Math.max(0, target), maxLeft);
+        try {
+          strip.scrollTo({ left, behavior: 'smooth' });
+        } catch (e) {
+          strip.scrollLeft = left;
+        }
+      }
+      const view = chip.closest('.view');
+      if (view && view.scrollLeft) view.scrollLeft = 0;
     } else {
       chip.classList.remove('active');
     }
@@ -4964,19 +5423,32 @@ function initVibeMoodChips() {
         // ones.
         const moodRequestId = ++state.moodRequestSeq;
         state.isFetchingVibe = false;
+        // Attribution from the previous mood must not label the new tracks.
+        state.vibeBatchId = null;
+        state.vibeBatchByTrack = {};
+        // The mood changes Rotor's station settings, so the old continuation
+        // cursor is meaningless: start reading the station from its new head.
+        setVibeCursor('user:onyourwave', null);
         try {
-          const data = await YandexClient.getVibe(state.token, null, 'user:onyourwave');
+          const loaded = await loadVibeTracksFromRotor({
+            station: 'user:onyourwave',
+            anchor: null,
+            minFresh: 8,
+            maxRequests: 4
+          });
           if (moodRequestId !== state.moodRequestSeq) return; // a newer mood won
-          if (data && data.tracks && data.tracks.length > 0) {
-            let nextTracks = dedupeVibeBatch(data.tracks, null, 100);
-            rememberVibeBatch(nextTracks, data.batchId);
-            if (nextTracks.length === 0) return;
-            state.queue = nextTracks;
-            state.queueIndex = 0;
-            const firstTrack = state.queue[0];
-            sendFeedback('radioStarted', firstTrack.id, 0);
-            playQueueTrack(firstTrack);
+          applyVibeLoad(loaded, 'user:onyourwave');
+          let nextTracks = loaded.tracks;
+          if (nextTracks.length === 0 && loaded.pool.length > 0) {
+            nextTracks = leastRecentlyPlayedVibeTracks(loaded.pool, null, 10);
           }
+          ensureVibeBatch(nextTracks, loaded.data && loaded.data.batchId);
+          if (nextTracks.length === 0) return;
+          state.queue = nextTracks;
+          state.queueIndex = 0;
+          const firstTrack = state.queue[0];
+          sendFeedback('radioStarted', firstTrack.id, 0);
+          playQueueTrack(firstTrack);
         } catch (err) {
           console.warn('Failed to reload vibe queue for new mood:', err);
         }
