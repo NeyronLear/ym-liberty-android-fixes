@@ -40,67 +40,6 @@ const PLACEHOLDER_COVER = 'favicon.png';
   stats.parentNode.insertBefore(hub, stats);
 })();
 
-// Queue helpers used by the "three dots" action sheet
-function isTrackInQueue(trackId) {
-  if (!Array.isArray(state.queue)) return -1;
-  const id = String(trackId);
-  return state.queue.findIndex(t => t && String(t.id) === id);
-}
-
-// A queue edit changes what "next" means, so the audio preloaded for the old
-// order must be dropped. Otherwise the crossfade would still play the track
-// that was next before "Играть следующим" inserted another one.
-function refreshAfterQueueChange() {
-  if (typeof dropStalePreload === 'function') dropStalePreload();
-  if (typeof preloadNextTrack === 'function') preloadNextTrack();
-  if (typeof savePlaybackState === 'function') savePlaybackState(true);
-}
-
-function addToQueue(track) {
-  if (!track || track.id == null) return;
-  if (!Array.isArray(state.queue)) state.queue = [];
-  if (isTrackInQueue(track.id) !== -1) {
-    if (typeof showToast === 'function') showToast('Трек уже в очереди', 'bi-info-circle');
-    return;
-  }
-  state.queue.push(track);
-  refreshAfterQueueChange();
-  if (typeof showToast === 'function') showToast('Добавлено в очередь', 'bi-check-circle');
-}
-
-function playNextInQueue(track) {
-  if (!track || track.id == null) return;
-  if (!Array.isArray(state.queue)) state.queue = [];
-
-  const id = String(track.id);
-  if (state.currentTrack && String(state.currentTrack.id) === id) {
-    if (typeof showToast === 'function') showToast('Этот трек уже играет', 'bi-info-circle');
-    return;
-  }
-
-  const existing = isTrackInQueue(id);
-  if (existing !== -1) state.queue.splice(existing, 1);
-
-  let base = typeof state.queueIndex === 'number' ? state.queueIndex : -1;
-  if (existing !== -1 && existing < base) base -= 1;
-
-  // Nothing is playing: start the track immediately instead of silently queueing it.
-  if (!state.currentTrack || state.queue.length === 0) {
-    state.queue.push(track);
-    state.queueIndex = state.queue.length - 1;
-    playQueueTrack(track);
-    return;
-  }
-
-  const insertAt = Math.min(Math.max(base + 1, 0), state.queue.length);
-  state.queue.splice(insertAt, 0, track);
-  // With shuffle on, the next track is taken from nextShuffleIndex, so point it
-  // at the freshly inserted track to honour "Играть следующим".
-  if (state.isShuffle && state.queueMode !== 'vibe') state.nextShuffleIndex = insertAt;
-  refreshAfterQueueChange();
-  if (typeof showToast === 'function') showToast('Будет играть следующим', 'bi-play-circle');
-}
-
 // --- DOM Elements ---
 const dom = {
   navBtns: document.querySelectorAll('.nav-btn'),

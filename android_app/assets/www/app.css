@@ -3352,10 +3352,6 @@ button:disabled {
   .vibe-hero {
     min-height: clamp(420px, 55vh, 540px);
   }
-
-  .vibe-mood-chips {
-    justify-content: flex-start;
-  }
 }
 
 @media (max-height: 700px) {

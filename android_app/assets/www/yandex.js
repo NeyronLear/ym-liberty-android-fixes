@@ -634,58 +634,11 @@ const YandexClient = {
     const data = await res.json();
     const artist = data.result?.artist || {};
 
-    // `brief-info` only returns the top 10 tracks in `popularTracks`.
-    // The official "Треки" tab lists the whole discography ordered by
-    // popularity, which is what the dedicated endpoint below provides.
-    // Page through it so the artist page is not capped at ten songs.
-    let rawTracks = [];
-    try {
-      const pageSize = 500;
-      let page = 0;
-      let total = Infinity;
-      const seen = new Set();
-      while (rawTracks.length < total && page < 50) {
-        const pageRes = await fetch(
-          `https://api.music.yandex.net/artists/${artistId}/tracks?page=${page}&page-size=${pageSize}`,
-          { headers }
-        );
-        if (!pageRes.ok) break;
-        const pageData = await pageRes.json();
-        const result = pageData.result || {};
-        const batch = Array.isArray(result.tracks)
-          ? result.tracks
-          : (Array.isArray(result) ? result : []);
-        if (batch.length === 0) break;
-
-        let addedThisPage = 0;
-        batch.forEach(t => {
-          if (!t || t.id == null) return;
-          const key = String(t.id);
-          if (seen.has(key)) return;
-          seen.add(key);
-          rawTracks.push(t);
-          addedThisPage += 1;
-        });
-        if (addedThisPage === 0) break;
-
-        const pager = result.pager || {};
-        if (Number.isFinite(Number(pager.total))) total = Number(pager.total);
-        page += 1;
-        // Do not stop on a short page: the server may cap the page size (it
-        // returns 20 per page for clients that do not honour page-size), and
-        // that used to cut the discography short. Empty / duplicate pages
-        // break the loop above, and `pager.total` tells us when we are done.
-        if (Number.isFinite(total) && total > 0 && rawTracks.length >= total) break;
-      }
-    } catch (e) {
-      rawTracks = [];
-    }
-
-    if (rawTracks.length === 0) {
-      rawTracks = data.result?.popularTracks || [];
-    }
-
-    const popularTracks = rawTracks.map(t => {
+    // `brief-info` only returns the top 10 tracks in `popularTracks`; the
+    // artist page immediately replaces them with the first page of
+    // YandexClient.getArtistTracks(), which lists the whole discography in
+    // the same order of popularity and pages in more on demand.
+    const popularTracks = (data.result?.popularTracks || []).map(t => {
       const cover = t.coverUri
         ? 'https://' + t.coverUri.replace('%%', '400x400')
         : t.albums?.[0]?.coverUri
