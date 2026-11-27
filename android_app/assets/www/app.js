@@ -1209,9 +1209,11 @@ async function playNext(isUserSkip = true) {
           if (extra.length === 0 && loaded.pool.length > 0) {
             extra = leastRecentlyPlayedVibeTracks(loaded.pool, existingIds, 10);
           }
-          if (extra.length > 0) {
-            ensureVibeBatch(extra, loaded.data && loaded.data.batchId);
-            state.queue = state.queue.concat(extra);
+          // A background refill may have appended the same tracks while this
+          // fallback was in flight; only add what the live queue lacks.
+          const added = appendFreshVibeTracks(extra);
+          if (added.length > 0) {
+            ensureVibeBatch(added, loaded.data && loaded.data.batchId);
           }
         } catch(e) {}
       }
@@ -1817,6 +1819,25 @@ function restorePlaybackState() {
     state.queue = session.queue || [];
     state.queueIndex = session.queueIndex || 0;
     state.queueMode = session.queueMode || 'library';
+    // Sessions saved before the refill-race fix can still contain the same
+    // track twice ahead of the current one. Drop those upcoming duplicates so
+    // the first playback after the update does not repeat a track.
+    if (state.queueMode === 'vibe' && Array.isArray(state.queue)) {
+      const seen = new Set();
+      for (let i = 0; i <= state.queueIndex && i < state.queue.length; i++) {
+        const id = state.queue[i] && state.queue[i].id;
+        if (id != null) seen.add(String(id));
+      }
+      state.queue = state.queue.filter((t, i) => {
+        if (i <= state.queueIndex) return true;
+        const id = t && t.id;
+        if (id == null) return true;
+        const key = String(id);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
     state.currentStation = session.currentStation || 'user:onyourwave';
     // Restore Rotor batch attribution so feedback is not silently dropped after
     // a restart (the gate in sendFeedback needs a batch id).
@@ -2624,6 +2645,33 @@ function leastRecentlyPlayedVibeTracks(candidates, extraIds, limit = 20) {
     .map(item => item.track);
 }
 
+/**
+ * Append tracks to the live Wave queue while re-checking it at append time.
+ * Refills snapshot the queue before awaiting Rotor, so two overlapping refills
+ * (a background preload and the end-of-queue fallback) can both append the same
+ * batch. That made a track play twice, and with a slow request up to three
+ * times in a row. Filtering here, against the queue as it is right now, closes
+ * that race no matter how many requests were in flight.
+ * @returns {Array} the tracks actually appended
+ */
+function appendFreshVibeTracks(tracks) {
+  if (!Array.isArray(tracks) || tracks.length === 0) return [];
+  const queued = new Set((state.queue || []).map(t => t && String(t.id)));
+  // The track that is playing right now must never be queued again, even if a
+  // restored/pruned queue no longer contains it.
+  if (state.currentTrack && state.currentTrack.id) queued.add(String(state.currentTrack.id));
+  const added = [];
+  tracks.forEach(t => {
+    if (!t || !t.id) return;
+    const id = String(t.id);
+    if (queued.has(id)) return;
+    queued.add(id);
+    added.push(t);
+  });
+  if (added.length > 0) state.queue = (state.queue || []).concat(added);
+  return added;
+}
+
 // Numeric object keys are enumerated in ascending order, not insertion order, so
 // pruning Object.keys() would drop the lowest track ids instead of the oldest
 // entries. Prefixing keeps the map ordered by the moment a track was seen.
@@ -2799,6 +2847,11 @@ async function startVibe() {
   // returned value also marks this session: a slower, older startVibe()/
   // startTrackVibe()/mood switch must not overwrite the newer one below.
   const sessionSeq = ++state.moodRequestSeq;
+  // Drop any refill still in flight for the abandoned session. It checks
+  // moodRequestSeq after its await and will not append, but the new queue must
+  // be allowed to start its own refill immediately.
+  vibeRefillPromise = null;
+  state.isFetchingVibe = false;
   state.vibeBatchId = null;
   state.vibeBatchByTrack = {};
   // A new session starts from the station's current position, not from a
@@ -2864,13 +2917,34 @@ async function startVibe() {
   }
 }
 
-async function fetchMoreVibeTracks() {
-  if (state.isFetchingVibe) return;
+// A background preload and the end-of-queue fallback can request more Wave
+// tracks at the same time. Both used to snapshot the queue before awaiting
+// Rotor, so they appended the same batch twice. Share the in-flight request
+// instead: whoever asks second awaits the same promise and sees the appended
+// tracks. This also avoids burning two Rotor requests for one refill.
+let vibeRefillPromise = null;
+
+function fetchMoreVibeTracks() {
+  if (vibeRefillPromise) return vibeRefillPromise;
+  const requestSeq = state.moodRequestSeq;
   state.isFetchingVibe = true;
+  const promise = fetchMoreVibeTracksOnce(requestSeq);
+  vibeRefillPromise = promise;
+  const clear = () => {
+    // A mood/session switch may already have replaced the slot; only the owner
+    // may clear it (and the busy flag).
+    if (vibeRefillPromise !== promise) return;
+    vibeRefillPromise = null;
+    state.isFetchingVibe = false;
+  };
+  promise.then(clear, clear);
+  return promise;
+}
+
+async function fetchMoreVibeTracksOnce(requestSeq) {
   // Captured before the awaits: if the user switches the mood while this
   // refill is in flight, state.moodRequestSeq moves on and every track below
   // belongs to the previous mood. Appending them would undo the switch.
-  const requestSeq = state.moodRequestSeq;
   try {
     const station = state.currentStation || 'user:onyourwave';
     const existingIds = new Set(state.queue.map(t => String(t.id)));
@@ -2891,15 +2965,22 @@ async function fetchMoreVibeTracks() {
     applyVibeLoad(loaded, station);
 
     let freshTracks = loaded.tracks;
+    let usedFallback = false;
     if (freshTracks.length === 0 && loaded.pool.length > 0) {
       // Rotor insists on repeats. Append the least recently played ones so the
       // wave keeps going, but never tracks that are already in the queue.
       freshTracks = leastRecentlyPlayedVibeTracks(loaded.pool, existingIds, 10);
-      ensureVibeBatch(freshTracks, loaded.data && loaded.data.batchId);
+      usedFallback = true;
     }
 
-    if (freshTracks.length > 0) {
-      state.queue = state.queue.concat(freshTracks);
+    // Re-check the live queue: another refill may have appended these tracks
+    // while this request was awaiting Rotor.
+    const added = appendFreshVibeTracks(freshTracks);
+    if (usedFallback && added.length > 0) {
+      ensureVibeBatch(added, loaded.data && loaded.data.batchId);
+    }
+
+    if (added.length > 0) {
       // Prune played tracks far in the past to avoid unbounded queue growth.
       // History (persisted, 1000 entries) is what actually prevents repeats,
       // so dropping old queue entries here is now safe.
@@ -2911,8 +2992,6 @@ async function fetchMoreVibeTracks() {
     }
   } catch(e) {
     console.error("Failed to fetch more vibe tracks", e);
-  } finally {
-    state.isFetchingVibe = false;
   }
 }
 
@@ -2946,6 +3025,8 @@ async function startTrackVibe(seedTrack) {
   // Abandon refills that belong to the previous station/mood. The returned
   // value marks this session so a slower, older request cannot take over.
   const sessionSeq = ++state.moodRequestSeq;
+  vibeRefillPromise = null;
+  state.isFetchingVibe = false;
   state.vibeBatchId = null;
   state.vibeBatchByTrack = {};
   setVibeCursor(state.currentStation, null);
@@ -5737,6 +5818,9 @@ function initVibeMoodChips() {
         // ones.
         const moodRequestId = ++state.moodRequestSeq;
         state.isFetchingVibe = false;
+        // Do not make the new mood wait for a refill started with the old
+        // settings; its own refill will start from the new station head.
+        vibeRefillPromise = null;
         // Attribution from the previous mood must not label the new tracks.
         state.vibeBatchId = null;
         state.vibeBatchByTrack = {};
